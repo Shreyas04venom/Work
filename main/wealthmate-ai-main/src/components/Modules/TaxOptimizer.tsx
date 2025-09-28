@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useMemo, useState, useRef } from "react";
+import * as XLSX from "xlsx";
 import { Upload, FileText, PieChart, TrendingUp, Download, Calculator, Zap, Target } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,53 +8,311 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+type Transaction = {
+  date?: string;
+  description: string;
+  amount: number; // positive numbers
+  type?: string; // debit/credit or income/expense
+  category?: string; // raw category if present in file
+  section?: "80C" | "80D" | "HRA" | "Others";
+};
+
+type CategorySummary = {
+  category: string;
+  amount: number;
+  eligible: boolean;
+  progress: number; // 0-100 relative to cap where applicable
+  section: "80C" | "80D" | "HRA" | "Others";
+};
+
+const CAPS = {
+  "80C": 150000,
+  "80D": 25000, // baseline; actual can vary but we keep simple
+  HRA: 0, // computed contextually; no fixed cap here for now
+};
 
 const TaxOptimizer = () => {
   const [taxRegime, setTaxRegime] = useState("new");
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [isExporting, setIsExporting] = useState(false);
   const [isOptimizing, setIsOptimizing] = useState(false);
+  const [basicSalary, setBasicSalary] = useState<number>(0);
+  const [hraReceived, setHraReceived] = useState<number>(0);
+  const [cityType, setCityType] = useState<"metro" | "non-metro">("non-metro");
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files || []);
-    setUploadedFiles(prev => [...prev, ...files.map(f => f.name)]);
-    toast({
-      title: "Files Uploaded",
-      description: `${files.length} file(s) uploaded successfully!`,
+  const readFileAsText = (file: File) =>
+    new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = reject;
+      reader.readAsText(file);
     });
+
+  const readFileAsArrayBuffer = (file: File) =>
+    new Promise<ArrayBuffer>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as ArrayBuffer);
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    });
+
+  // CSV line parser supporting quoted fields and embedded commas
+  const parseCSVLine = (line: string): string[] => {
+    const out: string[] = [];
+    let cur = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') { // escaped quote
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        out.push(cur.trim());
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    out.push(cur.trim());
+    return out;
+  };
+
+  const parseCSV = (csv: string): Transaction[] => {
+    const lines = csv.trim().split(/\r?\n/);
+    if (lines.length === 0) return [];
+    const headers = parseCSVLine(lines[0]).map(h => h.trim().toLowerCase());
+    const idx = {
+      date: headers.indexOf("date"),
+      description: headers.indexOf("description"),
+      amount: headers.indexOf("amount"),
+      type: headers.indexOf("type"),
+      category: headers.indexOf("category"),
+    };
+    const rows = lines.slice(1);
+    const txs: Transaction[] = [];
+    for (const row of rows) {
+      if (!row.trim()) continue;
+      const cols = parseCSVLine(row).map(c => c.trim());
+      const amountStr = idx.amount >= 0 ? cols[idx.amount] : "0";
+      const amount = Number(amountStr.replace(/[^0-9.-]/g, "")) || 0;
+      const description = idx.description >= 0 ? cols[idx.description] : "";
+      const date = idx.date >= 0 ? cols[idx.date] : undefined;
+      const type = idx.type >= 0 ? cols[idx.type] : undefined;
+      const category = idx.category >= 0 ? cols[idx.category] : undefined;
+      txs.push({ date, description, amount: Math.abs(amount), type, category });
+    }
+    return txs;
+  };
+
+  const categorySummaries: CategorySummary[] = useMemo(() => {
+    const byCategory = new Map<string, { amount: number; section: CategorySummary["section"] }>();
+    for (const t of transactions) {
+      const c = t.category || "Uncategorized";
+      const section = t.section || "Others";
+      const prev = byCategory.get(c) || { amount: 0, section };
+      byCategory.set(c, { amount: prev.amount + t.amount, section });
+    }
+    const result: CategorySummary[] = [];
+    for (const [category, { amount, section }] of byCategory.entries()) {
+      const cap = CAPS[section] || 0;
+      const progress = cap > 0 ? Math.min(100, Math.round((amount / cap) * 100)) : 0;
+      const eligible = section !== "Others";
+      result.push({ category, amount, eligible, progress, section });
+    }
+    return result.sort((a, b) => b.amount - a.amount);
+  }, [transactions]);
+
+  const deductionMetrics = useMemo(() => {
+    const totals = { "80C": 0, "80D": 0, HRA: 0 } as Record<"80C" | "80D" | "HRA", number>;
+    for (const t of transactions) {
+      if (t.section === "80C" || t.section === "80D" || t.section === "HRA") {
+        totals[t.section] += t.amount;
+      }
+    }
+    const used80C = Math.min(totals["80C"], CAPS["80C"]);
+    const remaining80C = Math.max(0, CAPS["80C"] - used80C);
+    const used80D = Math.min(totals["80D"], CAPS["80D"]);
+    const remaining80D = Math.max(0, CAPS["80D"] - used80D);
+    const hraPaid = totals["HRA"];
+
+    // Eligible HRA deduction requires salary context; compute if provided
+    const percentOfBasic = (cityType === "metro" ? 0.5 : 0.4) * (basicSalary || 0);
+    const rentMinusTenPercent = Math.max(0, hraPaid - 0.1 * (basicSalary || 0));
+    const eligibleHRA = Math.max(0, Math.min(hraReceived || 0, rentMinusTenPercent, percentOfBasic));
+
+    return {
+      used80C,
+      remaining80C,
+      used80D,
+      remaining80D,
+      hraPaid,
+      eligibleHRA,
+      potentialSavings80C: Math.round(remaining80C * 0.3),
+      potentialSavings80D: Math.round(remaining80D * 0.3),
+    };
+  }, [transactions, basicSalary, hraReceived, cityType]);
+
+  const categorizeTransaction = (t: Transaction): Transaction => {
+    const desc = (t.description || t.category || "").toLowerCase();
+    let section: Transaction["section"] = "Others";
+    let category = t.category;
+    // Simple keyword-based rules
+    if (/\brent\b|lease|landlord|nobroker|payrent|rentpayment/.test(desc)) {
+      section = "HRA";
+      category = "House Rent";
+    } else if (/elss|mutual fund|sip|ppf|nsc|ssy|ulip|tax saver|equity linked/.test(desc)) {
+      section = "80C";
+      category = category || "ELSS/PPF/NSC/ULIP";
+    } else if (/life\s*ins|term\s*ins|lic|hdfc\s*life|sbi\s*life|icici\s*prudential|max\s*life/.test(desc)) {
+      section = "80C";
+      category = category || "Life Insurance";
+    } else if (/health\s*ins|mediclaim|health policy|star health|care health/.test(desc)) {
+      section = "80D";
+      category = category || "Health Insurance";
+    } else if (/home loan|principal emi/.test(desc)) {
+      section = "80C";
+      category = category || "Home Loan Principal";
+    } else if (/interest|roi/.test(desc) && /home loan|housing/.test(desc)) {
+      section = "Others"; // 24(b) interest, not under 80C baseline
+      category = category || "Home Loan Interest";
+    } else if (/tuition|education|school fees|college fees/.test(desc)) {
+      section = "80C";
+      category = category || "Tuition Fees";
+    }
+    return { ...t, section, category };
+  };
+
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files || []);
+    if (!files.length) return;
+    const syntheticEvent = { target: { files } } as unknown as React.ChangeEvent<HTMLInputElement>;
+    await handleFileUpload(syntheticEvent);
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length === 0) return;
+    setUploadedFiles(prev => [...prev, ...files.map(f => f.name)]);
+    const allTx: Transaction[] = [];
+
+    for (const file of files) {
+      const ext = file.name.split(".").pop()?.toLowerCase();
+      try {
+        if (ext === "csv") {
+          const text = await readFileAsText(file);
+          const parsed = parseCSV(text).map(categorizeTransaction);
+          allTx.push(...parsed);
+        } else if (ext === "xlsx") {
+          const buf = await readFileAsArrayBuffer(file);
+          const wb = XLSX.read(new Uint8Array(buf), { type: "array" });
+          const sheet = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, { defval: "" });
+          const parsedXlsx: Transaction[] = rows.map((row) => {
+            const keys = Object.keys(row);
+            const getVal = (k: string) => {
+              const match = keys.find((kk) => kk.toLowerCase() === k);
+              return match ? row[match] : undefined;
+            };
+            const amountStr = String(getVal("amount") ?? "0");
+            const amount = Number(String(amountStr).replace(/[^0-9.-]/g, "")) || 0;
+            return {
+              date: getVal("date") ? String(getVal("date")) : undefined,
+              description: String(getVal("description") ?? ""),
+              amount: Math.abs(amount),
+              type: getVal("type") ? String(getVal("type")) : undefined,
+              category: getVal("category") ? String(getVal("category")) : undefined,
+            };
+          });
+          const categorized = parsedXlsx.map(categorizeTransaction);
+          allTx.push(...categorized);
+        } else if (ext === "pdf") {
+          toast({
+            title: "PDF not supported",
+            description: "Parsing PDFs is not available. Use CSV export from your bank.",
+          });
+        } else {
+          toast({
+            title: "Unsupported file type",
+            description: `File ${file.name} was skipped. Upload CSV for best results.`,
+          });
+        }
+      } catch (e) {
+        toast({
+          title: "Upload error",
+          description: `Failed to process ${file.name}`,
+        });
+      }
+    }
+
+    if (allTx.length > 0) {
+      setTransactions(prev => [...prev, ...allTx]);
+      toast({
+        title: "Files Processed",
+        description: `${allTx.length} transaction(s) imported and categorized`,
+      });
+    } else {
+      toast({
+        title: "No transactions parsed",
+        description: "Please upload CSV files with columns: date, description, amount, type, category",
+      });
+    }
   };
 
   const handleExportReport = async () => {
     setIsExporting(true);
-    toast({
-      title: "Exporting Report",
-      description: "Your tax optimization report is being exported...",
-    });
-    
-    setTimeout(() => {
-      setIsExporting(false);
+    const report = {
+      taxRegime,
+      transactions,
+      categorySummaries,
+      deductionMetrics,
+      generatedAt: new Date().toISOString(),
+    };
+    try {
+      const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `tax-optimizer-report-${new Date().toISOString().slice(0,10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
       toast({
         title: "Report Exported",
-        description: "Your tax optimization report has been exported successfully!",
+        description: "Downloaded tax optimizer report (JSON)",
       });
-    }, 2000);
+    } catch (e) {
+      toast({
+        title: "Export failed",
+        description: "Could not generate report. Please try again.",
+      });
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const handleOptimizeNow = () => {
     setIsOptimizing(true);
-    toast({
-      title: "Optimizing Taxes",
-      description: "AI is analyzing your data to optimize your tax savings...",
-    });
-    
+    const reAnalyzed = transactions.map(categorizeTransaction);
+    setTransactions(reAnalyzed);
     setTimeout(() => {
       setIsOptimizing(false);
       toast({
         title: "Optimization Complete",
-        description: "Your tax optimization is complete! Check the recommendations below.",
+        description: "Your data was re-analyzed. Review updated gaps and recommendations.",
       });
-    }, 3000);
+    }, 800);
   };
 
   const handleAction = (action: string, amount?: number) => {
@@ -183,12 +442,18 @@ const TaxOptimizer = () => {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="border-2 border-dashed border-border rounded-lg p-8 text-center hover:border-primary/50 transition-colors">
+            <div
+              className="border-2 border-dashed border-border rounded-lg p-8 text-center hover:border-primary/50 transition-colors"
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={handleDrop}
+              onClick={() => fileInputRef.current?.click()}
+            >
               <Upload className="h-8 w-8 text-muted-foreground mx-auto mb-2" />
               <div className="text-sm text-muted-foreground mb-4">
                 Drag & drop files or click to browse
               </div>
               <input
+                ref={fileInputRef}
                 type="file"
                 multiple
                 accept=".pdf,.csv,.xlsx"
@@ -196,11 +461,17 @@ const TaxOptimizer = () => {
                 className="hidden"
                 id="file-upload"
               />
-              <label htmlFor="file-upload">
-                <Button variant="outline" size="sm" className="cursor-pointer">
-                  Choose Files
-                </Button>
-              </label>
+              <Button
+                variant="outline"
+                size="sm"
+                className="cursor-pointer"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  fileInputRef.current?.click();
+                }}
+              >
+                Choose Files
+              </Button>
             </div>
 
             {uploadedFiles.length > 0 && (
@@ -230,28 +501,28 @@ const TaxOptimizer = () => {
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {[
-                { category: "House Rent", amount: 120000, progress: 80, eligible: true },
-                { category: "Life Insurance", amount: 25000, progress: 50, eligible: true },
-                { category: "ELSS Investments", amount: 80000, progress: 53, eligible: true },
-                { category: "Health Insurance", amount: 15000, progress: 60, eligible: true },
-                { category: "Home Loan EMI", amount: 200000, progress: 100, eligible: true }
-              ].map((item, index) => (
-                <div key={index} className="space-y-2">
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm font-medium">{item.category}</span>
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm">₹{item.amount.toLocaleString()}</span>
-                      {item.eligible && (
-                        <Badge variant="secondary" className="bg-success/20 text-success">
-                          Eligible
-                        </Badge>
-                      )}
-                    </div>
-                  </div>
-                  <Progress value={item.progress} className="h-2" />
+              {categorySummaries.length === 0 ? (
+                <div className="p-4 bg-secondary rounded text-center text-sm text-muted-foreground">
+                  No transactions imported yet. Upload CSV to see categories.
                 </div>
-              ))}
+              ) : (
+                categorySummaries.map((item, index) => (
+                  <div key={index} className="space-y-2">
+                    <div className="flex justify-between items-center">
+                      <span className="text-sm font-medium">{item.category}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm">₹{item.amount.toLocaleString()}</span>
+                        {item.eligible && (
+                          <Badge variant="secondary" className="bg-success/20 text-success">
+                            Eligible
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+                    <Progress value={item.progress} className="h-2" />
+                  </div>
+                ))
+              )}
             </div>
           </CardContent>
         </Card>
@@ -280,15 +551,15 @@ const TaxOptimizer = () => {
             <TabsContent value="80c" className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="text-center p-4 bg-secondary rounded-lg">
-                  <div className="text-2xl font-bold text-primary">₹80,000</div>
+                  <div className="text-2xl font-bold text-primary">₹{deductionMetrics.used80C.toLocaleString()}</div>
                   <div className="text-sm text-muted-foreground">Utilized</div>
                 </div>
                 <div className="text-center p-4 bg-warning/20 rounded-lg">
-                  <div className="text-2xl font-bold text-warning">₹70,000</div>
+                  <div className="text-2xl font-bold text-warning">₹{deductionMetrics.remaining80C.toLocaleString()}</div>
                   <div className="text-sm text-muted-foreground">Remaining</div>
                 </div>
                 <div className="text-center p-4 bg-success/20 rounded-lg">
-                  <div className="text-2xl font-bold text-success">₹21,000</div>
+                  <div className="text-2xl font-bold text-success">₹{deductionMetrics.potentialSavings80C.toLocaleString()}</div>
                   <div className="text-sm text-muted-foreground">Potential Savings</div>
                 </div>
               </div>
@@ -297,15 +568,15 @@ const TaxOptimizer = () => {
                 <div className="p-4 bg-accent/10 border border-accent/20 rounded-lg">
                   <div className="flex justify-between items-start">
                     <div>
-                      <h4 className="font-medium text-accent">Increase ELSS Investment</h4>
-                      <p className="text-sm text-muted-foreground">Invest ₹70,000 more in ELSS to maximize 80C</p>
+                      <h4 className="font-medium text-accent">Increase 80C Investments</h4>
+                      <p className="text-sm text-muted-foreground">Add eligible investments to fully utilize ₹{deductionMetrics.remaining80C.toLocaleString()} remaining</p>
                     </div>
                     <Button 
                       size="sm" 
                       variant="outline"
-                      onClick={() => handleAction("Invest in ELSS", 70000)}
+                      onClick={() => handleAction("Plan 80C investments", deductionMetrics.remaining80C)}
                     >
-                      Invest Now
+                      Plan Now
                     </Button>
                   </div>
                 </div>
@@ -313,9 +584,66 @@ const TaxOptimizer = () => {
             </TabsContent>
             
             <TabsContent value="80d" className="space-y-4">
-              <div className="p-4 bg-secondary/50 rounded-lg text-center">
-                <div className="text-lg text-muted-foreground">Health Insurance Analysis</div>
-                <div className="text-sm text-muted-foreground mt-2">Coming soon...</div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="text-center p-4 bg-secondary rounded-lg">
+                  <div className="text-2xl font-bold text-primary">₹{deductionMetrics.used80D.toLocaleString()}</div>
+                  <div className="text-sm text-muted-foreground">Utilized</div>
+                </div>
+                <div className="text-center p-4 bg-warning/20 rounded-lg">
+                  <div className="text-2xl font-bold text-warning">₹{deductionMetrics.remaining80D.toLocaleString()}</div>
+                  <div className="text-sm text-muted-foreground">Remaining</div>
+                </div>
+                <div className="text-center p-4 bg-success/20 rounded-lg">
+                  <div className="text-2xl font-bold text-success">₹{deductionMetrics.potentialSavings80D.toLocaleString()}</div>
+                  <div className="text-sm text-muted-foreground">Potential Savings</div>
+                </div>
+              </div>
+              <div className="p-4 bg-secondary/50 rounded-lg">
+                <div className="text-sm text-muted-foreground">Add or adjust health insurance premiums to utilize remaining 80D benefits.</div>
+              </div>
+            </TabsContent>
+
+            <TabsContent value="hra" className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="text-center p-4 bg-secondary rounded-lg">
+                  <div className="text-2xl font-bold text-primary">₹{deductionMetrics.hraPaid.toLocaleString()}</div>
+                  <div className="text-sm text-muted-foreground">Rent Paid (Parsed)</div>
+                </div>
+                <div className="text-center p-4 bg-success/20 rounded-lg">
+                  <div className="text-2xl font-bold text-success">₹{deductionMetrics.eligibleHRA.toLocaleString()}</div>
+                  <div className="text-sm text-muted-foreground">Eligible HRA Deduction</div>
+                </div>
+                <div className="text-center p-4 bg-warning/20 rounded-lg">
+                  <div className="text-2xl font-bold text-warning">{cityType === "metro" ? "Metro" : "Non-Metro"}</div>
+                  <div className="text-sm text-muted-foreground">City Type</div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="basic-salary">Basic Salary (Annual)</Label>
+                  <Input id="basic-salary" type="number" value={basicSalary || ''} onChange={(e) => setBasicSalary(Number(e.target.value) || 0)} placeholder="e.g., 600000" />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="hra-received">HRA Received (Annual)</Label>
+                  <Input id="hra-received" type="number" value={hraReceived || ''} onChange={(e) => setHraReceived(Number(e.target.value) || 0)} placeholder="e.g., 120000" />
+                </div>
+                <div className="space-y-2">
+                  <Label>City Type</Label>
+                  <Select value={cityType} onValueChange={(v) => setCityType(v as any)}>
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="metro">Metro</SelectItem>
+                      <SelectItem value="non-metro">Non-Metro</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <div className="p-3 text-xs text-muted-foreground bg-secondary rounded">
+                We calculate HRA as the minimum of HRA received, Rent paid minus 10% of basic salary, and 50% (metro) or 40% (non-metro) of basic salary.
               </div>
             </TabsContent>
           </Tabs>
