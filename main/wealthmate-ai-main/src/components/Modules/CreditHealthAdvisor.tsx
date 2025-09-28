@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { CreditCard, TrendingUp, AlertTriangle, CheckCircle, Sliders, Zap, Target, BarChart3 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Slider as SliderComponent } from "@/components/ui/slider";
 import { useToast } from "@/hooks/use-toast";
+import { Input } from "@/components/ui/input";
 
 const CreditHealthAdvisor = () => {
   const [currentScore, setCurrentScore] = useState(720);
@@ -15,6 +16,17 @@ const CreditHealthAdvisor = () => {
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
   const [isQuickAction, setIsQuickAction] = useState(false);
   const { toast } = useToast();
+
+  // Accuracy inputs for better scoring
+  const [totalCreditLimit, setTotalCreditLimit] = useState<number>(850000);
+  const [amountUsed, setAmountUsed] = useState<number>(280000);
+  const [monthlyIncome, setMonthlyIncome] = useState<number>(120000);
+  const [monthlyEMI, setMonthlyEMI] = useState<number>(25000);
+  const [avgCreditAgeYears, setAvgCreditAgeYears] = useState<number>(5.2);
+  const [revolvingAccounts, setRevolvingAccounts] = useState<number>(3);
+  const [installmentAccounts, setInstallmentAccounts] = useState<number>(2);
+  const [missedPaymentsLast24, setMissedPaymentsLast24] = useState<number>(1);
+  const [hardInquiriesLast12, setHardInquiriesLast12] = useState<number>(2);
 
   const getScoreColor = (score: number) => {
     if (score >= 750) return "text-success";
@@ -29,12 +41,38 @@ const CreditHealthAdvisor = () => {
     return { text: "Poor", color: "destructive" };
   };
 
+  const metrics = useMemo(() => {
+    const utilizationPct = totalCreditLimit > 0 ? Math.round((amountUsed / totalCreditLimit) * 100) : 0;
+    const dtiPct = monthlyIncome > 0 ? Math.round((monthlyEMI / monthlyIncome) * 100) : 0;
+    const paymentRate = Math.min(100, Math.max(0, 100 - Math.round((missedPaymentsLast24 / 24) * 100)));
+    const mixScore = (() => {
+      const total = revolvingAccounts + installmentAccounts;
+      if (total === 0) return 50;
+      const ratio = revolvingAccounts / total;
+      const balancePenalty = Math.abs(0.5 - ratio) * 100;
+      return Math.max(50, Math.round(100 - balancePenalty));
+    })();
+    return { utilizationPct, dtiPct, paymentRate, mixScore };
+  }, [totalCreditLimit, amountUsed, monthlyIncome, monthlyEMI, missedPaymentsLast24, revolvingAccounts, installmentAccounts]);
+
   const simulateScore = () => {
-    const utilizationImpact = (30 - creditUtilization[0]) * 2;
-    const paymentImpact = (paymentHistory[0] - 95) * 3;
-    const accountImpact = Math.max(0, (2 - newAccounts[0]) * 10);
-    
-    return Math.min(850, Math.max(300, currentScore + utilizationImpact + paymentImpact + accountImpact));
+    const wPayment = 0.35;
+    const wUtil = 0.30;
+    const wAge = 0.15;
+    const wNew = 0.10;
+    const wMix = 0.10;
+
+    const paymentSub = metrics.paymentRate;
+    const utilSub = Math.max(0, 100 - Math.max(0, metrics.utilizationPct - 10) * 2.5);
+    const ageSub = Math.min(100, Math.round((avgCreditAgeYears / 10) * 100));
+    const newSub = Math.max(0, 100 - hardInquiriesLast12 * 15 - Math.max(0, newAccounts[0] - 1) * 10);
+    const mixSub = metrics.mixScore;
+
+    const composite = wPayment * paymentSub + wUtil * utilSub + wAge * ageSub + wNew * newSub + wMix * mixSub;
+    const base = 300;
+    const projected = Math.round(base + (composite / 100) * (850 - base));
+    const dtiAdj = metrics.dtiPct > 40 ? -Math.min(40, Math.round((metrics.dtiPct - 40) * 0.8)) : 0;
+    return Math.min(850, Math.max(300, projected + dtiAdj));
   };
 
   const projectedScore = simulateScore();
@@ -74,6 +112,76 @@ const CreditHealthAdvisor = () => {
       description: impact ? `Action initiated: ${impact}` : "Action initiated successfully!",
     });
   };
+
+  // REVERT: disable memoized recommendations
+  /* const recommendations = useMemo(() => {
+    const recs: Array<{ title: string; color: string; description: string; impact: string; action: string; onClick: () => void }> = [];
+    const util = metrics.utilizationPct;
+    const targetUtil = 30;
+    if (util > targetUtil) {
+      const desiredUsed = Math.round((targetUtil / 100) * totalCreditLimit);
+      const paydown = Math.max(0, amountUsed - desiredUsed);
+      recs.push({
+        title: "Reduce Credit Utilization",
+        color: "primary",
+        description: `Pay down ₹${paydown.toLocaleString()} to reach ${targetUtil}% utilization`,
+        impact: "+15-25 points",
+        action: "View Plan",
+        onClick: () => handleAction("View Credit Utilization Plan", "+15-25 points"),
+      });
+      recs.push({
+        title: "Request Credit Limit Increase",
+        color: "accent",
+        description: "Ask issuers for 10-20% limit increase to lower utilization",
+        impact: "+8-12 points",
+        action: "Apply Now",
+        onClick: () => handleAction("Apply for Credit Limit Increase", "+8-12 points"),
+      });
+    }
+    if (missedPaymentsLast24 > 0) {
+      recs.push({
+        title: "Stabilize Payment History",
+        color: "success",
+        description: "Set autopay and clear overdue balances to avoid delinquencies",
+        impact: "+10-20 points over 3-6 months",
+        action: "Setup Autopay",
+        onClick: () => handleAction("Setup Autopay & Reminders", "+10-20 points over 3-6 months"),
+      });
+    }
+    if (hardInquiriesLast12 >= 2 || newAccounts[0] >= 2) {
+      recs.push({
+        title: "Limit New Credit Applications",
+        color: "warning",
+        description: "Pause new applications for 3-6 months to recover inquiry impact",
+        impact: "+5-10 points",
+        action: "Plan Pause",
+        onClick: () => handleAction("Limit New Credit Applications", "+5-10 points"),
+      });
+    }
+    if (metrics.dtiPct > 40) {
+      recs.push({
+        title: "Lower Debt-to-Income (DTI)",
+        color: "warning",
+        description: "Prepay loans or refinance to bring DTI under 35%",
+        impact: "+5-12 points",
+        action: "Explore Options",
+        onClick: () => handleAction("Lower Debt-to-Income (DTI)", "+5-12 points"),
+      });
+    }
+    if (metrics.mixScore < 70) {
+      recs.push({
+        title: "Balance Credit Mix",
+        color: "success",
+        description: "Consider adjusting revolving vs installment accounts to improve mix",
+        impact: "+3-7 points",
+        action: "Explore",
+        onClick: () => handleAction("Explore Credit Mix Options", "+3-7 points"),
+      });
+    }
+    return recs;
+  }, [metrics, totalCreditLimit, amountUsed, missedPaymentsLast24, hardInquiriesLast12, newAccounts]); */
+
+  // REVERT: remove export insights handler
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -251,49 +359,88 @@ const CreditHealthAdvisor = () => {
             Credit Score Simulator
           </CardTitle>
           <CardDescription>
-            See how changes to your credit behavior could impact your score
+            See how changes to your profile and behavior impact your score
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
             {/* Simulation Controls */}
             <div className="space-y-6">
+              {/* Profile Inputs for accuracy */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Total Credit Limit (₹)</label>
+                  <Input type="number" value={totalCreditLimit}
+                    onChange={(e) => setTotalCreditLimit(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Amount Used (₹)</label>
+                  <Input type="number" value={amountUsed}
+                    onChange={(e) => setAmountUsed(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Monthly Income (₹)</label>
+                  <Input type="number" value={monthlyIncome}
+                    onChange={(e) => setMonthlyIncome(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Monthly EMI (₹)</label>
+                  <Input type="number" value={monthlyEMI}
+                    onChange={(e) => setMonthlyEMI(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Avg Credit Age (years)</label>
+                  <Input type="number" step="0.1" value={avgCreditAgeYears}
+                    onChange={(e) => setAvgCreditAgeYears(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Hard Inquiries (12m)</label>
+                  <Input type="number" value={hardInquiriesLast12}
+                    onChange={(e) => setHardInquiriesLast12(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Missed Payments (24m)</label>
+                  <Input type="number" value={missedPaymentsLast24}
+                    onChange={(e) => setMissedPaymentsLast24(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Revolving Accounts</label>
+                  <Input type="number" value={revolvingAccounts}
+                    onChange={(e) => setRevolvingAccounts(Number(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Installment Accounts</label>
+                  <Input type="number" value={installmentAccounts}
+                    onChange={(e) => setInstallmentAccounts(Number(e.target.value) || 0)} />
+                </div>
+              </div>
               <div className="space-y-3">
                 <label className="text-sm font-medium">
-                  Credit Utilization: {creditUtilization[0]}%
+                  Credit Utilization: {metrics.utilizationPct}%
                 </label>
-                <SliderComponent
-                  value={creditUtilization}
-                  onValueChange={setCreditUtilization}
-                  max={100}
-                  step={1}
-                  className="w-full"
-                />
                 <div className="text-xs text-muted-foreground">
-                  Current: 35% → Recommended: Below 30%
+                  Recommended: Below 30%
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  DTI: {metrics.dtiPct}% (Aim &lt; 35%)
                 </div>
               </div>
 
               <div className="space-y-3">
                 <label className="text-sm font-medium">
-                  Payment History: {paymentHistory[0]}%
+                  Payment History: {metrics.paymentRate}%
                 </label>
-                <SliderComponent
-                  value={paymentHistory}
-                  onValueChange={setPaymentHistory}
-                  max={100}
-                  min={70}
-                  step={1}
-                  className="w-full"
-                />
                 <div className="text-xs text-muted-foreground">
-                  Current: 98% → Target: 100%
+                  Missed in 24m: {missedPaymentsLast24}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  Target: 100% on-time payments
                 </div>
               </div>
 
               <div className="space-y-3">
                 <label className="text-sm font-medium">
-                  New Accounts (Last 6 months): {newAccounts[0]}
+                  New Accounts (Last 6 months): {newAccounts[0]} | Inquiries: {hardInquiriesLast12}
                 </label>
                 <SliderComponent
                   value={newAccounts}
@@ -333,25 +480,19 @@ const CreditHealthAdvisor = () => {
 
               <div className="space-y-3">
                 <h4 className="font-medium">Impact Analysis</h4>
-                
-                {creditUtilization[0] <= 30 && (
+                <div className="p-3 bg-secondary border rounded-lg text-sm">
+                  Utilization: {metrics.utilizationPct}% • DTI: {metrics.dtiPct}% • Age: {avgCreditAgeYears}y
+                </div>
+                {metrics.utilizationPct <= 30 && (
                   <div className="p-3 bg-success/20 border border-success/30 rounded-lg">
                     <div className="text-sm font-medium text-success">Credit Utilization Optimized</div>
-                    <div className="text-xs text-success/80">+15-20 point boost expected</div>
+                    <div className="text-xs text-success/80">+15-25 point boost expected</div>
                   </div>
                 )}
-                
-                {paymentHistory[0] === 100 && (
-                  <div className="p-3 bg-success/20 border border-success/30 rounded-lg">
-                    <div className="text-sm font-medium text-success">Perfect Payment History</div>
-                    <div className="text-xs text-success/80">Maintains high score</div>
-                  </div>
-                )}
-                
-                {newAccounts[0] === 0 && (
-                  <div className="p-3 bg-success/20 border border-success/30 rounded-lg">
-                    <div className="text-sm font-medium text-success">No New Credit Inquiries</div>
-                    <div className="text-xs text-success/80">+5-10 point boost over time</div>
+                {metrics.dtiPct >= 40 && (
+                  <div className="p-3 bg-warning/20 border border-warning/30 rounded-lg">
+                    <div className="text-sm font-medium text-warning">High DTI</div>
+                    <div className="text-xs text-warning/80">Reduce EMI or increase income to mitigate penalty</div>
                   </div>
                 )}
               </div>
@@ -372,83 +513,96 @@ const CreditHealthAdvisor = () => {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="p-4 bg-primary/10 border border-primary/20 rounded-lg">
-              <div className="flex items-start justify-between">
-                <div className="space-y-2">
-                  <h4 className="font-medium text-primary">Reduce Credit Utilization</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Pay down ₹1.2L to bring utilization below 30%
-                  </p>
-                  <div className="text-xs text-primary">Impact: +15-25 points</div>
-                </div>
-                <Button 
-                  size="sm" 
-                  variant="outline"
-                  onClick={() => handleAction("View Credit Utilization Plan", "+15-25 points")}
-                >
-                  View Plan
-                </Button>
+          {/** Dynamic recommendations based on profile */}
+          {(() => {
+            const recs = [] as Array<{ title: string; color: string; description: string; impact: string; action: string; onClick: () => void }>;
+            const util = metrics.utilizationPct;
+            const targetUtil = 30;
+            if (util > targetUtil) {
+              const desiredUsed = Math.round((targetUtil / 100) * totalCreditLimit);
+              const paydown = Math.max(0, amountUsed - desiredUsed);
+              recs.push({
+                title: "Reduce Credit Utilization",
+                color: "primary",
+                description: `Pay down ₹${paydown.toLocaleString()} to reach ${targetUtil}% utilization`,
+                impact: "+15-25 points",
+                action: "View Plan",
+                onClick: () => handleAction("View Credit Utilization Plan", "+15-25 points"),
+              });
+              recs.push({
+                title: "Request Credit Limit Increase",
+                color: "accent",
+                description: "Ask issuers for 10-20% limit increase to lower utilization",
+                impact: "+8-12 points",
+                action: "Apply Now",
+                onClick: () => handleAction("Apply for Credit Limit Increase", "+8-12 points"),
+              });
+            }
+            if (missedPaymentsLast24 > 0) {
+              recs.push({
+                title: "Stabilize Payment History",
+                color: "success",
+                description: "Set autopay and clear overdue balances to avoid delinquencies",
+                impact: "+10-20 points over 3-6 months",
+                action: "Setup Autopay",
+                onClick: () => handleAction("Setup Autopay & Reminders", "+10-20 points over 3-6 months"),
+              });
+            }
+            if (hardInquiriesLast12 >= 2 || newAccounts[0] >= 2) {
+              recs.push({
+                title: "Limit New Credit Applications",
+                color: "warning",
+                description: "Pause new applications for 3-6 months to recover inquiry impact",
+                impact: "+5-10 points",
+                action: "Plan Pause",
+                onClick: () => handleAction("Limit New Credit Applications", "+5-10 points"),
+              });
+            }
+            if (metrics.dtiPct > 40) {
+              recs.push({
+                title: "Lower Debt-to-Income (DTI)",
+                color: "warning",
+                description: "Prepay loans or refinance to bring DTI under 35%",
+                impact: "+5-12 points",
+                action: "Explore Options",
+                onClick: () => handleAction("Lower Debt-to-Income (DTI)", "+5-12 points"),
+              });
+            }
+            if (metrics.mixScore < 70) {
+              recs.push({
+                title: "Balance Credit Mix",
+                color: "success",
+                description: "Consider adjusting revolving vs installment accounts to improve mix",
+                impact: "+3-7 points",
+                action: "Explore",
+                onClick: () => handleAction("Explore Credit Mix Options", "+3-7 points"),
+              });
+            }
+            return (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {recs.length === 0 ? (
+                  <div className="p-4 bg-secondary rounded text-sm text-muted-foreground">
+                    Your profile looks strong. Keep up consistent payments and low utilization.
+                  </div>
+                ) : (
+                  recs.map((r, i) => (
+                    <div key={i} className={`p-4 bg-${r.color}/10 border border-${r.color}/20 rounded-lg`}>
+                      <div className="flex items-start justify-between">
+                        <div className="space-y-2">
+                          <h4 className={`font-medium text-${r.color}`}>{r.title}</h4>
+                          <p className="text-sm text-muted-foreground">{r.description}</p>
+                          <div className={`text-xs text-${r.color}`}>Impact: {r.impact}</div>
+                        </div>
+                        <Button size="sm" variant="outline" onClick={r.onClick}>
+                          {r.action}
+                        </Button>
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
-            </div>
-
-            <div className="p-4 bg-accent/10 border border-accent/20 rounded-lg">
-              <div className="flex items-start justify-between">
-                <div className="space-y-2">
-                  <h4 className="font-medium text-accent">Increase Credit Limit</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Request limit increase on 2 existing cards
-                  </p>
-                  <div className="text-xs text-accent">Impact: +10-15 points</div>
-                </div>
-                <Button 
-                  size="sm" 
-                  variant="outline"
-                  onClick={() => handleAction("Apply for Credit Limit Increase", "+10-15 points")}
-                >
-                  Apply Now
-                </Button>
-              </div>
-            </div>
-
-            <div className="p-4 bg-success/10 border border-success/20 rounded-lg">
-              <div className="flex items-start justify-between">
-                <div className="space-y-2">
-                  <h4 className="font-medium text-success">Diversify Credit Mix</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Consider a small personal loan or retail account
-                  </p>
-                  <div className="text-xs text-success">Impact: +5-10 points</div>
-                </div>
-                <Button 
-                  size="sm" 
-                  variant="outline"
-                  onClick={() => handleAction("Explore Credit Mix Options", "+5-10 points")}
-                >
-                  Explore
-                </Button>
-              </div>
-            </div>
-
-            <div className="p-4 bg-warning/10 border border-warning/20 rounded-lg">
-              <div className="flex items-start justify-between">
-                <div className="space-y-2">
-                  <h4 className="font-medium text-warning">Monitor Credit Report</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Set up alerts for any changes to your credit report
-                  </p>
-                  <div className="text-xs text-warning">Prevents: Score drops</div>
-                </div>
-                <Button 
-                  size="sm" 
-                  variant="outline"
-                  onClick={() => handleAction("Setup Credit Monitoring Alerts", "Prevents score drops")}
-                >
-                  Setup Alerts
-                </Button>
-              </div>
-            </div>
-          </div>
+            );
+          })()}
         </CardContent>
       </Card>
     </div>
