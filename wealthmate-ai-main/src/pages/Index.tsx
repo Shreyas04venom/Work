@@ -11,7 +11,7 @@ import AdvancedAnalytics from "@/components/Analytics/AdvancedAnalytics";
 import { useToast } from "@/hooks/use-toast";
 
 const Index = () => {
-  const [activeModule, setActiveModule] = useState<"tax" | "credit" | "finance" | "profile" | "simulator" | "nudges" | "documents" | "analytics">("tax");
+  const [activeModule, setActiveModule] = useState<"tax" | "credit" | "finance" | "profile" | "simulator" | "nudges" | "documents" | "analytics">("analytics");
   const [isLoading, setIsLoading] = useState(false);
   const [userId] = useState("demo-user"); // In real app, get from auth context
   const { toast } = useToast();

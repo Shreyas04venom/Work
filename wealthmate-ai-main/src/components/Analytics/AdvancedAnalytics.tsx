@@ -26,6 +26,7 @@ import {
   BarChart, 
   Bar, 
   PieChart as RechartsPieChart, 
+  Pie,
   Cell,
   XAxis, 
   YAxis, 
@@ -62,8 +63,9 @@ const AdvancedAnalytics = ({ userId }: AnalyticsProps) => {
   const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884D8', '#82CA9D'];
 
   useEffect(() => {
+    console.log('Generating analytics data for user:', userId);
     generateAnalyticsData();
-  }, [selectedPeriod]);
+  }, [selectedPeriod, userId]);
 
   const generateAnalyticsData = async () => {
     setIsLoading(true);
@@ -208,10 +210,11 @@ const AdvancedAnalytics = ({ userId }: AnalyticsProps) => {
   if (isLoading) {
     return (
       <div className="space-y-6">
-        <div className="flex items-center justify-center h-96">
+        <div className="flex items-center justify-center min-h-[600px]">
           <div className="text-center">
-            <RefreshCw className="h-8 w-8 animate-spin text-primary mx-auto mb-4" />
-            <p className="text-muted-foreground">Generating analytics insights...</p>
+            <RefreshCw className="h-12 w-12 animate-spin text-primary mx-auto mb-4" />
+            <p className="text-xl font-medium">Generating analytics insights...</p>
+            <p className="text-muted-foreground mt-2">This may take a few moments</p>
           </div>
         </div>
       </div>
